@@ -5,7 +5,7 @@ Instalador de Kernel csr79a — compila e instala automáticamente la última ve
 ## Qué hace
 
 1. Instala las dependencias de compilación necesarias desde los repos oficiales de Debian (incluye `debhelper` y `libdw-dev`, requeridas por `bindeb-pkg` y `dwarves`).
-2. Comprueba que hay al menos 20GB libres en disco antes de empezar.
+2. Comprueba que hay al menos 50GB libres en disco antes de empezar.
 3. Detecta si Secure Boot está activado y avisa del riesgo de arrancar un kernel sin firmar.
 4. Detecta la última versión estable publicada en [kernel.org](https://kernel.org).
 5. Calcula un número de jobs de compilación recomendado según tus hilos y RAM, y te deja elegir entre ese valor o usar todos los hilos.
@@ -44,7 +44,7 @@ No lo ejecutes como root: el script pedirá `sudo` cuando lo necesite.
 
 - Debian (o derivado) con `sudo` configurado.
 - Conexión a internet.
-- Espacio en disco: al menos 20GB libres (el script lo comprueba antes de empezar).
+- Espacio en disco: al menos 50GB libres (el script lo comprueba antes de empezar).
 
 Más detalles en [MANUAL.md](MANUAL.md).
 

@@ -8,7 +8,7 @@ Automatizar el flujo completo de compilación de un kernel Linux vanilla en Debi
 
 - Debian o derivado (Trixie, Sid, etc.).
 - Usuario con permisos de `sudo`.
-- Al menos 20GB libres en disco (el script lo comprueba antes de empezar y aborta si no hay suficiente).
+- Al menos 50GB libres en disco (el script lo comprueba antes de empezar y aborta si no hay suficiente).
 - Conexión a internet.
 
 ## 3. Preparar los archivos
@@ -53,7 +53,7 @@ Muestra el nombre y versión del instalador, una descripción breve, y pide conf
 
 ### 5.2. Comprobación de espacio en disco
 
-Antes de descargar o compilar nada, el script comprueba que haya al menos 20GB libres en el directorio de trabajo (`~/kernel-build`). Si no los hay, se detiene inmediatamente con un mensaje claro, en vez de fallar a mitad de una compilación de 20-30 minutos.
+Antes de descargar o compilar nada, el script comprueba que haya al menos 50GB libres en el directorio de trabajo (`~/kernel-build`). Si no los hay, se detiene inmediatamente con un mensaje claro, en vez de fallar a mitad de una compilación de 20-30 minutos.
 
 ### 5.3. Detección de Secure Boot
 

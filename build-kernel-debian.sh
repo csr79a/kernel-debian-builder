@@ -67,8 +67,8 @@ whiptail --title "Instalador de Kernel csr79a" \
 # ---------------------------------------------------------------------------
 log "Comprobando espacio en disco disponible..."
 AVAIL_GB="$(df --output=avail -BG "$WORKDIR" | tail -1 | tr -d 'G ')"
-if (( AVAIL_GB < 20 )); then
-    error "Solo hay ${AVAIL_GB}GB libres en ${WORKDIR}. Se recomiendan al menos 20-25GB para compilar."
+if (( AVAIL_GB < 50 )); then
+    error "Solo hay ${AVAIL_GB}GB libres en ${WORKDIR}. Se recomiendan al menos 50GB para compilar con todos los módulos del kernel de Debian."
 fi
 ok "Espacio disponible: ${AVAIL_GB}GB."
 
