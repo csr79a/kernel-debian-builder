@@ -11,14 +11,52 @@
 #   ./build-kernel-debian.sh
 #
 # Requiere: Debian o derivado, con sudo configurado.
+#
+# Historial de versiones:
+#   1.1.3 - Se añade el WKD de kernel.org (resuelto por HTTPS contra su
+#           propio dominio) como tercera fuente para importar las claves
+#           PGP, por si ambos keyservers estuvieran caídos a la vez.
+#   1.1.2 - Se usa 'apt install' en vez de 'dpkg -i' para instalar los
+#           paquetes .deb generados, de forma que las dependencias que
+#           falten se resuelvan automáticamente en vez de dejar el
+#           sistema en estado roto.
+#   1.1.1 - Corrección de bugs menores: comprobación de 'sudo', falso
+#           positivo al detectar el kernel ya instalado, protección del
+#           glob al instalar los .deb, manejo de error en la consulta a
+#           kernel.org y validación del formato de versión recibido.
+#           Se añade verificación de firma PGP (autenticidad, además del
+#           SHA256 ya existente) contra las claves oficiales de
+#           kernel.org.
+#   1.1.0 - Versión base: descarga desde kernel.org, verificación SHA256,
+#           compilación con opciones ASUS forzadas, generación e
+#           instalación de paquetes .deb, regeneración de GRUB.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
+VERSION="1.1.3"
 WORKDIR="${HOME}/kernel-build"
 SB_ENABLED="no"
+GNUPGHOME="${WORKDIR}/.gnupg-kernel"
+
+# Claves PGP oficiales reconocidas para firmar releases de kernel.org.
+# Fuente: https://kernel.org/category/signatures.html
+# Solo se acepta una firma si coincide con una de estas huellas exactas;
+# no se confía en el "web of trust" ni en el nivel de confianza de gpg.
+KERNEL_PGP_FPRS=(
+    "ABAF11C65A2970B130ABE3C479BE3E4300411886"  # Linus Torvalds
+    "647F28654894E3BD457199BE38DBBDC86092693"   # Greg Kroah-Hartman
+)
+
+# Correo asociado a cada huella, usado como último recurso vía WKD
+# (Web Key Directory de kernel.org, resuelto por HTTPS directamente
+# contra su dominio: https://www.kernel.org/signature.html).
+declare -A KERNEL_PGP_EMAILS=(
+    ["ABAF11C65A2970B130ABE3C479BE3E4300411886"]="torvalds@kernel.org"
+    ["647F28654894E3BD457199BE38DBBDC86092693"]="gregkh@kernel.org"
+)
 
 log()   { echo -e "\e[1;34m[*]\e[0m $*"; }
 ok()    { echo -e "\e[1;32m[OK]\e[0m $*"; }
@@ -36,8 +74,11 @@ if [[ $EUID -eq 0 ]]; then
     error "No ejecutes este script como root directamente. Usa tu usuario normal; se pedirá sudo cuando haga falta."
 fi
 
+require_cmd "sudo"
+
 DEPS=(build-essential libncurses-dev bison flex libssl-dev libelf-dev
-      dwarves libdw-dev debhelper fakeroot bc rsync curl jq whiptail mokutil)
+      dwarves libdw-dev debhelper fakeroot bc rsync curl jq whiptail mokutil
+      gnupg xz-utils)
 
 MISSING=()
 for pkg in "${DEPS[@]}"; do
@@ -59,8 +100,8 @@ cd "$WORKDIR"
 # 1. Pantalla de bienvenida
 # ---------------------------------------------------------------------------
 whiptail --title "Instalador de Kernel csr79a" \
-    --yesno "Versión del Instalador de Kernel csr79a 1.1.0\n\nEste programa descargará, compilará e instalará el último kernel estable desde kernel.org.\n\nEl tiempo dependerá de tu hardware (hilos y RAM disponibles).\n\n¿Desea continuar?" \
-    14 60 || exit 0
+    --yesno "Versión del Instalador de Kernel csr79a ${VERSION}\n\nEste programa descargará, verificará (SHA256 + firma PGP), compilará e instalará el último kernel estable desde kernel.org.\n\nEl tiempo dependerá de tu hardware (hilos y RAM disponibles).\n\n¿Desea continuar?" \
+    16 70 || exit 0
 
 # ---------------------------------------------------------------------------
 # 2. Comprobar espacio en disco
@@ -92,14 +133,18 @@ fi
 # ---------------------------------------------------------------------------
 log "Consultando la última versión estable en kernel.org..."
 
-RELEASES_JSON="$(curl -fsSL https://www.kernel.org/releases.json)"
+RELEASES_JSON="$(curl -fsSL https://www.kernel.org/releases.json)" \
+    || error "No se pudo contactar con kernel.org. Comprueba tu conexión a internet e inténtalo de nuevo."
 KVERSION="$(echo "$RELEASES_JSON" | jq -r '.releases[] | select(.moniker=="stable") | .version' | head -n1)"
 
 [[ -n "$KVERSION" ]] || error "No se pudo determinar la última versión estable."
+[[ "$KVERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] \
+    || error "La versión recibida de kernel.org ('${KVERSION}') no tiene el formato esperado."
 
 ok "Última versión estable: ${KVERSION}"
 
-if uname -r | grep -q "^${KVERSION}"; then
+CURRENT_KVER="$(uname -r)"
+if [[ "$CURRENT_KVER" == "$KVERSION" || "$CURRENT_KVER" == "$KVERSION".* || "$CURRENT_KVER" == "$KVERSION"-* ]]; then
     warn "Ya estás ejecutando el kernel ${KVERSION}. Nada que hacer."
     exit 0
 fi
@@ -151,6 +196,64 @@ SHA_LINE="$(curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v${KMAJOR}.x/sha
 echo "$SHA_LINE" | sha256sum -c - || error "¡La verificación SHA256 ha fallado! Fuente corrupta o manipulada."
 ok "Suma SHA256 verificada correctamente."
 
+# ---------------------------------------------------------------------------
+# 6.1 Verificación de firma PGP (autenticidad, además de la integridad SHA256)
+# ---------------------------------------------------------------------------
+#
+# El SHA256 anterior protege contra corrupción de descarga, pero se obtiene
+# del mismo servidor que el propio tarball: si un mirror estuviera
+# comprometido, podría servir tarball y checksum falsos a la vez. La firma
+# PGP añade una capa de autenticidad independiente: solo se acepta si el
+# release está firmado por una de las claves oficiales reconocidas en
+# $KERNEL_PGP_FPRS.
+
+mkdir -p "$GNUPGHOME"
+chmod 700 "$GNUPGHOME"
+export GNUPGHOME
+
+log "Importando claves PGP oficiales de kernel.org (si no están ya en el llavero local)..."
+for fpr in "${KERNEL_PGP_FPRS[@]}"; do
+    if ! gpg --batch --list-keys "$fpr" >/dev/null 2>&1; then
+        gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys "$fpr" >/dev/null 2>&1 \
+            || gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$fpr" >/dev/null 2>&1 \
+            || gpg --batch --locate-keys "${KERNEL_PGP_EMAILS[$fpr]:-}" >/dev/null 2>&1 \
+            || warn "No se pudo importar la clave ${fpr} (fallaron ambos keyservers y el WKD de kernel.org). La verificación fallará si el release está firmado solo con esa clave."
+    fi
+done
+
+SIGN_FILE="linux-${KVERSION}.tar.sign"
+SIGN_URL="https://cdn.kernel.org/pub/linux/kernel/v${KMAJOR}.x/${SIGN_FILE}"
+
+log "Descargando firma PGP (${SIGN_FILE})..."
+curl -fsSL -o "$SIGN_FILE" "$SIGN_URL"
+
+GPG_LOG="${WORKDIR}/gpg-verify-${KVERSION}.log"
+log "Verificando firma PGP contra el tarball (puede tardar unos segundos)..."
+if ! xz -cd "$TARBALL" | gpg --batch --status-fd 1 --verify "$SIGN_FILE" - > "$GPG_LOG" 2>&1; then
+    cat "$GPG_LOG" >&2
+    error "La verificación PGP ha FALLADO para ${TARBALL}. No se continúa: el archivo podría no ser auténtico."
+fi
+
+KNOWN_MATCH=0
+MATCHED_FPR=""
+for fpr in "${KERNEL_PGP_FPRS[@]}"; do
+    if grep -q "$fpr" "$GPG_LOG"; then
+        KNOWN_MATCH=1
+        MATCHED_FPR="$fpr"
+        break
+    fi
+done
+
+if [[ "$KNOWN_MATCH" -ne 1 ]]; then
+    cat "$GPG_LOG" >&2
+    error "La firma es criptográficamente válida pero de una clave NO reconocida. Se aborta por seguridad."
+fi
+
+ok "Firma PGP verificada correctamente (clave reconocida: ${MATCHED_FPR})."
+
+# ---------------------------------------------------------------------------
+# 6.2 Extraer el código fuente
+# ---------------------------------------------------------------------------
 SRC_DIR="linux-${KVERSION}"
 if [[ ! -d "$SRC_DIR" ]]; then
     log "Extrayendo código fuente..."
@@ -200,10 +303,18 @@ ok "Compilación terminada. Paquetes .deb generados en ${WORKDIR}."
 # 9. Instalar los paquetes generados
 # ---------------------------------------------------------------------------
 cd "$WORKDIR"
+
+shopt -s nullglob
 DEBS=(linux-image-"${KVERSION}"-custom_*.deb linux-headers-"${KVERSION}"-custom_*.deb)
+shopt -u nullglob
+
+[[ ${#DEBS[@]} -ge 2 ]] || error "No se encontraron los paquetes .deb esperados en ${WORKDIR}. Revisa ${LOGFILE} para ver si la compilación generó otros nombres de archivo."
 
 log "Instalando paquetes: ${DEBS[*]}"
-sudo dpkg -i "${DEBS[@]}"
+# Se usa 'apt install' (no 'dpkg -i') para que, si al kernel nuevo le
+# faltara alguna dependencia, apt la resuelva e instale automáticamente
+# en vez de dejar el sistema con paquetes a medio instalar.
+sudo apt install -y "${DEBS[@]/#/./}"
 
 # ---------------------------------------------------------------------------
 # 10. Regenerar GRUB
