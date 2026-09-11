@@ -171,6 +171,23 @@ cp "$CURRENT_CONFIG" .config
 make olddefconfig
 
 # ---------------------------------------------------------------------------
+# 7.1 Forzar opciones de hardware ASUS que 'olddefconfig' no activa solo
+# ---------------------------------------------------------------------------
+#
+# 'olddefconfig' hereda tal cual las opciones que ya estaban desactivadas
+# en la config de origen; si en algún momento CONFIG_ASUS_ARMOURY quedó
+# desactivada (p. ej. por arrancar sin querer un kernel antiguo/de serie
+# antes de ejecutar este script), esa ausencia se propagaría para siempre
+# de build en build. Se fuerza aquí explícitamente para evitarlo.
+log "Forzando opciones de hardware ASUS necesarias (asus_armoury y afines)..."
+scripts/config --enable CONFIG_ASUS_WMI
+scripts/config --enable CONFIG_ASUS_ARMOURY
+scripts/config --enable CONFIG_FIRMWARE_ATTRIBUTES_CLASS
+scripts/config --enable CONFIG_ASUS_NB_WMI
+scripts/config --enable CONFIG_HID_ASUS
+make olddefconfig
+
+# ---------------------------------------------------------------------------
 # 8. Compilar y generar los .deb
 # ---------------------------------------------------------------------------
 LOGFILE="${WORKDIR}/build-${KVERSION}.log"
