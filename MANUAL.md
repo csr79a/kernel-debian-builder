@@ -1,8 +1,10 @@
 # MANUAL — kernel-debian-builder (Instalador de Kernel csr79a)
 
+Versión actual: **1.1.3**.
+
 ## 1. Objetivo del proyecto
 
-Automatizar el flujo completo de compilación de un kernel Linux vanilla en Debian: desde la descarga del código fuente en kernel.org hasta tener el nuevo kernel arrancable desde GRUB, sin herramientas externas a los repos oficiales de Debian, con una interfaz de pantallas interactiva (`whiptail`).
+Automatizar el flujo completo de compilación de un kernel Linux vanilla en Debian: desde la descarga verificada del código fuente en kernel.org hasta tener el nuevo kernel arrancable desde GRUB, sin herramientas externas a los repos oficiales de Debian, con una interfaz de pantallas interactiva (`whiptail`).
 
 ## 2. Requisitos previos
 
@@ -44,6 +46,8 @@ Paquetes desde los repos oficiales de Debian:
 - `jq`
 - `whiptail` (interfaz de pantallas)
 - `mokutil` (detección de Secure Boot)
+- `gnupg` (verificación de firma PGP)
+- `xz-utils` (descomprimir el tarball para verificarlo contra la firma)
 
 ## 5. Flujo paso a paso
 
@@ -82,7 +86,7 @@ El paso 3 requiere interacción física en el arranque y no se puede automatizar
 
 ### 5.4. Detección de versión
 
-El script consulta `https://www.kernel.org/releases.json` y extrae la versión marcada como `stable`. Si ya estás corriendo esa versión, el script termina sin hacer nada.
+El script consulta `https://www.kernel.org/releases.json` y extrae la versión marcada como `stable`, validando que el formato recibido sea el esperado (por si la API cambiara de forma inesperada). Compara esa versión contra `uname -r` con **igualdad exacta** (o como prefijo seguido de `.` o `-`), para evitar falsos positivos: por ejemplo, una versión objetivo `6.1` ya no se confunde con un kernel actual `6.12.5-custom` solo porque coincidan los primeros caracteres. Si ya estás corriendo la versión estable más reciente, el script termina sin hacer nada.
 
 ### 5.5. Cálculo de jobs de compilación
 
@@ -102,15 +106,28 @@ Ejemplos:
 | 16GB | 8     | 7                  |
 | 8GB  | 16    | 3                  |
 
-### 5.6. Descarga y verificación
+### 5.6. Descarga y verificación de integridad (SHA256)
 
 Descarga el `.tar.xz` desde `cdn.kernel.org` y verifica su suma SHA256 contra el fichero de sumas oficial publicado junto a cada release. Si la verificación falla, el script se detiene inmediatamente.
 
-### 5.7. Configuración (.config)
+### 5.7. Verificación de autenticidad (firma PGP)
+
+El SHA256 anterior protege contra corrupción de descarga, pero se obtiene del mismo servidor que el propio tarball: si un mirror estuviera comprometido, en teoría podría servir tarball y checksum falsos a la vez. La firma PGP añade una capa de autenticidad independiente:
+
+1. El script importa las claves oficiales de **Linus Torvalds** y **Greg Kroah-Hartman** (huellas ancladas explícitamente en el script, no se confía en el "web of trust" de gpg), probando tres fuentes en orden: `keyserver.ubuntu.com`, `keys.openpgp.org` y, como último recurso, el **WKD de kernel.org** (`gpg --locate-keys torvalds@kernel.org gregkh@kernel.org`, el método que la propia kernel.org documenta como oficial en `kernel.org/signature.html`).
+2. Descarga la firma `.tar.sign` correspondiente y la verifica contra el tarball descomprimido (`xz -cd | gpg --verify`), que es el método exacto que documenta kernel.org.
+3. Comprueba que la firma provenga de una de las huellas ancladas — una firma criptográficamente válida pero de una clave no reconocida también se rechaza.
+4. El llavero PGP se mantiene aislado en `~/kernel-build/.gnupg-kernel`, sin tocar el `~/.gnupg` real del usuario.
+
+Si cualquiera de estos pasos falla, el script se detiene sin compilar.
+
+### 5.8. Configuración (.config)
 
 Copia `/boot/config-$(uname -r)` (la configuración del kernel que tienes corriendo ahora mismo) y ejecuta `make olddefconfig`, que adapta esa configuración a las nuevas opciones de la versión más reciente, minimizando el riesgo de perder soporte de hardware o módulos que ya usas.
 
-### 5.8. Compilación
+A continuación, fuerza explícitamente las opciones de hardware ASUS (`CONFIG_ASUS_WMI`, `CONFIG_ASUS_ARMOURY`, `CONFIG_FIRMWARE_ATTRIBUTES_CLASS`, `CONFIG_ASUS_NB_WMI`, `CONFIG_HID_ASUS`), por si la config heredada las tuviera desactivadas (por ejemplo, por haber arrancado alguna vez un kernel de serie sin esas opciones activas). Sin este paso, esa ausencia se propagaría de build en build.
+
+### 5.9. Compilación
 
 ```bash
 make -j$JOBS bindeb-pkg LOCALVERSION=-custom
@@ -118,19 +135,19 @@ make -j$JOBS bindeb-pkg LOCALVERSION=-custom
 
 `bindeb-pkg` es el target oficial del propio kernel Linux para generar paquetes `.deb`. El sufijo `-custom` permite distinguir este kernel de los que vienen de los repos de Debian. El log completo de la compilación se guarda en `~/kernel-build/build-<version>.log`.
 
-### 5.9. Instalación
+### 5.10. Instalación
 
-Los `.deb` generados se instalan con `dpkg -i`, quedando registrados en el sistema de paquetes de Debian como cualquier otro paquete.
+Los `.deb` generados se instalan con `sudo apt install` (no `dpkg -i`), para que si al kernel nuevo le faltara alguna dependencia, apt la resuelva e instale automáticamente en vez de dejar el sistema con paquetes a medio instalar. Antes de instalar, el script comprueba que efectivamente se hayan generado los paquetes esperados (`linux-image-*` y `linux-headers-*`).
 
-### 5.10. GRUB
+### 5.11. GRUB
 
 El script ejecuta `sudo update-grub` de forma explícita al final de la instalación.
 
-### 5.11. Limpieza de archivos
+### 5.12. Limpieza de archivos
 
 Pregunta si quieres eliminar el contenido de `~/kernel-build` (fuente descargada, código extraído, `.deb` generados). Si dices que no, se conservan por si quieres reinstalarlos o revisar el log.
 
-### 5.12. Pantalla final y reinicio
+### 5.13. Pantalla final y reinicio
 
 Muestra un resumen de la versión instalada (con nota sobre Secure Boot si aplica) y ofrece reiniciar ahora o después. El nuevo kernel no estará activo hasta que reinicies.
 
@@ -147,4 +164,12 @@ sudo update-grub
 
 - Por ahora solo soporta kernel **vanilla** (sin parches). Podría añadirse en el futuro un paso opcional para aplicar parches sueltos (p. ej. schedulers alternativos) sobre la base vanilla.
 - La firma automática con clave MOK para Secure Boot no está implementada todavía — de momento es un proceso manual documentado arriba.
+- No hay verificación de que el módulo DKMS de NVIDIA se haya reconstruido correctamente para el kernel nuevo antes de reiniciar (pendiente de añadir).
 - Pensado para Debian; en otras distros basadas en `.deb` debería funcionar igual, pero no está probado.
+
+## 8. Historial de versiones
+
+- **1.1.3** — Se añade el WKD de kernel.org (resuelto por HTTPS contra su propio dominio) como tercera fuente para importar las claves PGP, por si ambos keyservers estuvieran caídos a la vez.
+- **1.1.2** — Se usa `apt install` en vez de `dpkg -i` para instalar los paquetes `.deb` generados, resolviendo dependencias automáticamente en vez de dejar el sistema a medias.
+- **1.1.1** — Corrección de bugs menores: comprobación de `sudo`, falso positivo al detectar el kernel ya instalado, protección del glob al instalar los `.deb`, manejo de error en la consulta a kernel.org y validación del formato de versión recibido. Se añade verificación de firma PGP (autenticidad, además del SHA256 ya existente) contra las claves oficiales de kernel.org.
+- **1.1.0** — Versión base: descarga desde kernel.org, verificación SHA256, compilación con opciones ASUS forzadas, generación e instalación de paquetes `.deb`, regeneración de GRUB.
