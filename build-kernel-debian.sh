@@ -8,11 +8,24 @@
 # kernel (bindeb-pkg), los instala y regenera GRUB.
 #
 # Uso:
-#   ./build-kernel-debian.sh
+#   ./build-kernel-debian.sh [--force]
+#
+#   --force  Ignora la comprobación de "ya tienes esta versión" y
+#            recompila igualmente. Necesario si ya generaste un kernel
+#            -custom con este script y quieres repetir el build con un
+#            .config distinto (p. ej. tras añadir una nueva opción
+#            forzada en la sección 7.x), ya que 'uname -r' seguirá
+#            reportando la misma versión con el sufijo -custom.
 #
 # Requiere: Debian o derivado, con sudo configurado.
 #
 # Historial de versiones:
+#   1.1.4 - Se añade el flag --force para poder recompilar el mismo
+#           número de versión con un .config distinto (la comprobación
+#           de "ya la tienes" comparaba solo el número de versión, no
+#           el contenido del .config). Se añade la sección 7.2, que
+#           fuerza CONFIG_SCHED_CLASS_EXT (y sus dependencias BPF/BTF)
+#           para poder usar sched-ext (scx_lavd, scx_bpfland, etc.).
 #   1.1.3 - Se añade el WKD de kernel.org (resuelto por HTTPS contra su
 #           propio dominio) como tercera fuente para importar las claves
 #           PGP, por si ambos keyservers estuvieran caídos a la vez.
@@ -36,10 +49,11 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
-VERSION="1.1.3"
+VERSION="1.1.4"
 WORKDIR="${HOME}/kernel-build"
 SB_ENABLED="no"
 GNUPGHOME="${WORKDIR}/.gnupg-kernel"
+FORCE="no"
 
 # Claves PGP oficiales reconocidas para firmar releases de kernel.org.
 # Fuente: https://kernel.org/category/signatures.html
@@ -62,6 +76,13 @@ log()   { echo -e "\e[1;34m[*]\e[0m $*"; }
 ok()    { echo -e "\e[1;32m[OK]\e[0m $*"; }
 warn()  { echo -e "\e[1;33m[!]\e[0m $*"; }
 error() { echo -e "\e[1;31m[ERROR]\e[0m $*" >&2; exit 1; }
+
+for arg in "$@"; do
+    case "$arg" in
+        --force) FORCE="yes" ;;
+        *) error "Argumento desconocido: '$arg'. Uso: $0 [--force]" ;;
+    esac
+done
 
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || error "Falta el comando '$1'. Instálalo e inténtalo de nuevo."
@@ -145,8 +166,12 @@ ok "Última versión estable: ${KVERSION}"
 
 CURRENT_KVER="$(uname -r)"
 if [[ "$CURRENT_KVER" == "$KVERSION" || "$CURRENT_KVER" == "$KVERSION".* || "$CURRENT_KVER" == "$KVERSION"-* ]]; then
-    warn "Ya estás ejecutando el kernel ${KVERSION}. Nada que hacer."
-    exit 0
+    if [[ "$FORCE" == "yes" ]]; then
+        warn "Ya estás ejecutando el kernel ${KVERSION} (${CURRENT_KVER}), pero se continúa por --force."
+    else
+        warn "Ya estás ejecutando el kernel ${KVERSION}. Nada que hacer. (Usa --force para recompilar igualmente, p. ej. tras cambiar opciones en la sección 7.x.)"
+        exit 0
+    fi
 fi
 
 KMAJOR="${KVERSION%%.*}"
@@ -291,6 +316,34 @@ scripts/config --enable CONFIG_HID_ASUS
 make olddefconfig
 
 # ---------------------------------------------------------------------------
+# 7.2 Forzar soporte de sched_ext (scx_*), requerido por csr79a/scx-scheds
+# ---------------------------------------------------------------------------
+#
+# Igual que con las opciones ASUS de arriba: si el kernel de origen no
+# tenía esto activado, 'olddefconfig' lo heredaría desactivado para
+# siempre. Se fuerza aquí para que el kernel resultante soporte cargar
+# schedulers BPF de sched-ext (scx_lavd, scx_bpfland, etc.) sin tener
+# que recompilar de nuevo solo por esto.
+#
+# CONFIG_SCHED_CLASS_EXT depende de BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF
+# (kernel/Kconfig.preempt). DEBUG_INFO_BTF necesita 'pahole' en el PATH
+# durante la compilación para generar BTF desde DWARF; 'dwarves' (ya
+# está en DEPS más arriba) lo provee.
+log "Forzando soporte de sched_ext (CONFIG_SCHED_CLASS_EXT y dependencias)..."
+scripts/config --enable CONFIG_BPF
+scripts/config --enable CONFIG_BPF_SYSCALL
+scripts/config --enable CONFIG_BPF_JIT
+scripts/config --enable CONFIG_BPF_JIT_ALWAYS_ON
+scripts/config --enable CONFIG_BPF_JIT_DEFAULT_ON
+scripts/config --enable CONFIG_DEBUG_INFO_BTF
+scripts/config --enable CONFIG_SCHED_CLASS_EXT
+make olddefconfig
+
+if ! grep -q '^CONFIG_SCHED_CLASS_EXT=y' .config; then
+    warn "CONFIG_SCHED_CLASS_EXT no quedó activado tras 'olddefconfig' (revisa si falta alguna dependencia no forzada aquí). El kernel se compilará igualmente, pero sin soporte de sched_ext."
+fi
+
+# ---------------------------------------------------------------------------
 # 8. Compilar y generar los .deb
 # ---------------------------------------------------------------------------
 LOGFILE="${WORKDIR}/build-${KVERSION}.log"
@@ -314,7 +367,15 @@ log "Instalando paquetes: ${DEBS[*]}"
 # Se usa 'apt install' (no 'dpkg -i') para que, si al kernel nuevo le
 # faltara alguna dependencia, apt la resuelva e instale automáticamente
 # en vez de dejar el sistema con paquetes a medio instalar.
-sudo apt install -y "${DEBS[@]/#/./}"
+#
+# Con --force (mismo KVERSION que el ya instalado, p. ej. tras cambiar
+# opciones en la sección 7.x y recompilar), el .deb generado tiene el
+# mismo número de versión que el ya instalado. Sin --reinstall, apt lo
+# detecta como "ya está en su versión más reciente" y NO lo reinstala,
+# aunque el contenido (el .config usado) sea distinto.
+APT_INSTALL_FLAGS=(-y)
+[[ "$FORCE" == "yes" ]] && APT_INSTALL_FLAGS+=(--reinstall)
+sudo apt install "${APT_INSTALL_FLAGS[@]}" "${DEBS[@]/#/./}"
 
 # ---------------------------------------------------------------------------
 # 10. Regenerar GRUB
