@@ -20,6 +20,27 @@
 # Requiere: Debian o derivado, con sudo configurado.
 #
 # Historial de versiones:
+#   1.8.0 - Las secciones 7.1 (ASUS), 7.2 (sched-ext) y 7.3 (NTSYNC) pasan
+#           de "siempre preguntar" a "check-first": se añade la función
+#           base_has() (comprueba contra $CURRENT_CONFIG, antes de copiarlo
+#           a .config, si el símbolo ancla de cada sección ya está en =y o
+#           =m). Motivo: en Debian 13/trixie (kernel 6.12) esos símbolos
+#           solían faltar en la config base, así que preguntar y forzar
+#           tenía sentido; pero en kernels más recientes (Debian Sid/14,
+#           kernel 7.x) ya vienen resueltos de serie — comprobado en
+#           máquina real (César, Debian Sid, kernel 7.2.7+deb14-amd64):
+#           CONFIG_SCHED_CLASS_EXT=y, CONFIG_NTSYNC=m y los símbolos ASUS
+#           (CONFIG_ASUS_WMI/ARMOURY/NB_WMI/CONFIG_HID_ASUS) en =m. Sin
+#           este cambio, cada build en un kernel así repetía una pregunta
+#           whiptail que no iba a cambiar nada en el .config final. Se
+#           trata =y y =m como equivalentes ("ya satisfecho"): la
+#           diferencia entre built-in y módulo cargable no importa aquí,
+#           el driver está disponible en ambos casos. Si el símbolo ancla
+#           SÍ falta en la config base, cada sección se comporta exacta-
+#           mente igual que en 1.7.1 (misma pregunta, mismo forzado). El
+#           parche BORE (6.x/7.4) y la sección de microarquitectura de CPU
+#           (5.5, generic/v3/znver3) quedan sin cambios: ninguno depende
+#           de qué trae la config base del kernel en ejecución.
 #   1.7.1 - Corrección en 7.2 (sched-ext): forzar CONFIG_DEBUG_INFO_BTF por
 #           sí solo no bastaba. Depende de "!DEBUG_INFO_NONE" (choice en
 #           lib/Kconfig.debug), y un kernel de Debian normal hereda
@@ -251,7 +272,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
-VERSION="1.7.1"
+VERSION="1.8.0"
 WORKDIR="${HOME}/kernel-build"
 SB_ENABLED="no"
 GNUPGHOME="${WORKDIR}/.gnupg-kernel"
@@ -884,13 +905,29 @@ log "Preparando configuración a partir del kernel actual ($(uname -r))..."
 CURRENT_CONFIG="/boot/config-$(uname -r)"
 [[ -f "$CURRENT_CONFIG" ]] || error "No se encontró ${CURRENT_CONFIG}."
 
+# base_has(): comprueba si un símbolo ya viene activado en la config del
+# kernel en ejecución (ANTES de tocar nada), como built-in (=y) o como
+# módulo (=m). Se usa en 7.1/7.2/7.3 para no preguntar por algo que la
+# propia distro ya trae resuelto — cada vez más probable a medida que
+# Debian avanza de versión de kernel (lo que hoy hay que forzar a mano en
+# Debian 13/trixie puede venir ya de serie en Sid o en Debian 14).
+# =y y =m cuentan igual como "ya satisfecho": la diferencia entre venir
+# incrustado en el kernel o como módulo cargable no importa aquí, el
+# driver está disponible en ambos casos.
+base_has() {
+    grep -qE "^${1}=(y|m)\$" "$CURRENT_CONFIG"
+}
+
 cp "$CURRENT_CONFIG" .config
 make olddefconfig
 
 # ---------------------------------------------------------------------------
-# 7.1 Opciones de hardware ASUS (asus_armoury y afines): se pregunta,
-#     nunca se fuerza. La detección DMI solo informa el texto de la
-#     pregunta y el botón por defecto; la decisión es siempre del usuario.
+# 7.1 Opciones de hardware ASUS (asus_armoury y afines): check-first.
+#     Si la config base ya trae CONFIG_ASUS_ARMOURY resuelto (=y o =m),
+#     no se pregunta ni se fuerza nada, solo se avisa. En kernels
+#     recientes (Sid, Debian 14 en adelante) esto ya viene de serie; la
+#     pregunta whiptail solo entra en juego con un kernel base donde de
+#     verdad falte, como el 6.12 de Debian 13/trixie.
 # ---------------------------------------------------------------------------
 #
 # 'olddefconfig' hereda tal cual las opciones que ya estaban desactivadas
@@ -900,41 +937,49 @@ make olddefconfig
 # build salvo que se reactive aquí.
 ASUS_APPLIED="no"
 
-# DMI: identifica al fabricante real de la máquina (placa/firmware), sin
-# necesidad de instalar nada. En un equipo ASUS, sys_vendor suele devolver
-# "ASUSTeK COMPUTER INC.". Esto NO decide nada por sí solo: solo cambia el
-# texto de la pregunta y qué botón queda resaltado por defecto.
-ASUS_SYS_VENDOR="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo "")"
-if [[ "$ASUS_SYS_VENDOR" =~ [Aa][Ss][Uu][Ss] ]]; then
-    ASUS_DETECTED="yes"
+if base_has CONFIG_ASUS_ARMOURY; then
+    ok "El soporte de hardware ASUS (CONFIG_ASUS_ARMOURY) ya viene resuelto en tu kernel base. No hace falta preguntar ni forzar nada."
 else
-    ASUS_DETECTED="no"
-fi
+    # DMI: identifica al fabricante real de la máquina (placa/firmware), sin
+    # necesidad de instalar nada. En un equipo ASUS, sys_vendor suele devolver
+    # "ASUSTeK COMPUTER INC.". Esto NO decide nada por sí solo: solo cambia el
+    # texto de la pregunta y qué botón queda resaltado por defecto.
+    ASUS_SYS_VENDOR="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo "")"
+    if [[ "$ASUS_SYS_VENDOR" =~ [Aa][Ss][Uu][Ss] ]]; then
+        ASUS_DETECTED="yes"
+    else
+        ASUS_DETECTED="no"
+    fi
 
-if [[ "$ASUS_DETECTED" == "yes" ]]; then
-    ASUS_YESNO_FLAGS=()
-    ASUS_MSG="Se ha detectado hardware ASUS en este equipo (fabricante DMI: \"${ASUS_SYS_VENDOR}\").\n\n¿Deseas activar el soporte específico de ASUS (asus_armoury, ASUS WMI, HID) en el kernel?\n\nEsto activa CONFIG_ASUS_WMI, CONFIG_ASUS_ARMOURY, CONFIG_FIRMWARE_ATTRIBUTES_CLASS, CONFIG_ASUS_NB_WMI y CONFIG_HID_ASUS."
-else
-    ASUS_YESNO_FLAGS=(--defaultno)
-    ASUS_MSG="No se ha detectado hardware ASUS en este equipo (fabricante DMI: \"${ASUS_SYS_VENDOR:-desconocido}\").\n\n¿Deseas activar igualmente el soporte específico de ASUS (asus_armoury, ASUS WMI, HID)?\n\nSi tu equipo no es ASUS, estas opciones no tendrán ningún efecto (ni bueno ni malo): los símbolos simplemente no se usan."
-fi
+    if [[ "$ASUS_DETECTED" == "yes" ]]; then
+        ASUS_YESNO_FLAGS=()
+        ASUS_MSG="Se ha detectado hardware ASUS en este equipo (fabricante DMI: \"${ASUS_SYS_VENDOR}\").\n\n¿Deseas activar el soporte específico de ASUS (asus_armoury, ASUS WMI, HID) en el kernel?\n\nEsto activa CONFIG_ASUS_WMI, CONFIG_ASUS_ARMOURY, CONFIG_FIRMWARE_ATTRIBUTES_CLASS, CONFIG_ASUS_NB_WMI y CONFIG_HID_ASUS."
+    else
+        ASUS_YESNO_FLAGS=(--defaultno)
+        ASUS_MSG="No se ha detectado hardware ASUS en este equipo (fabricante DMI: \"${ASUS_SYS_VENDOR:-desconocido}\").\n\n¿Deseas activar igualmente el soporte específico de ASUS (asus_armoury, ASUS WMI, HID)?\n\nSi tu equipo no es ASUS, estas opciones no tendrán ningún efecto (ni bueno ni malo): los símbolos simplemente no se usan."
+    fi
 
-if whiptail --title "Instalador de Kernel csr79a" "${ASUS_YESNO_FLAGS[@]}" \
-    --yesno "$ASUS_MSG" 16 76; then
-    log "Activando opciones de hardware ASUS (asus_armoury y afines)..."
-    scripts/config --enable CONFIG_ASUS_WMI
-    scripts/config --enable CONFIG_ASUS_ARMOURY
-    scripts/config --enable CONFIG_FIRMWARE_ATTRIBUTES_CLASS
-    scripts/config --enable CONFIG_ASUS_NB_WMI
-    scripts/config --enable CONFIG_HID_ASUS
-    ASUS_APPLIED="yes"
-else
-    log "Se omite el soporte de hardware ASUS por elección del usuario."
+    if whiptail --title "Instalador de Kernel csr79a" "${ASUS_YESNO_FLAGS[@]}" \
+        --yesno "$ASUS_MSG" 16 76; then
+        log "Activando opciones de hardware ASUS (asus_armoury y afines)..."
+        scripts/config --enable CONFIG_ASUS_WMI
+        scripts/config --enable CONFIG_ASUS_ARMOURY
+        scripts/config --enable CONFIG_FIRMWARE_ATTRIBUTES_CLASS
+        scripts/config --enable CONFIG_ASUS_NB_WMI
+        scripts/config --enable CONFIG_HID_ASUS
+        ASUS_APPLIED="yes"
+    else
+        log "Se omite el soporte de hardware ASUS por elección del usuario."
+    fi
 fi
 
 # ---------------------------------------------------------------------------
-# 7.2 Soporte de sched_ext (scx_*, usado por scx-scheds): opcional, se
-#     pregunta. No es hardware, es una decisión con coste real en build.
+# 7.2 Soporte de sched_ext (scx_*, usado por scx-scheds): check-first.
+#     Si CONFIG_SCHED_CLASS_EXT ya viene resuelto (=y o =m) en la config
+#     base, no hace falta preguntar ni pagar el coste de build de
+#     DEBUG_INFO_BTF/pahole: ya está. Esto ya es el caso en kernels
+#     recientes (sched_ext llegó a mainline en 6.12); la pregunta con su
+#     explicación de coste solo entra en juego si de verdad falta.
 # ---------------------------------------------------------------------------
 #
 # CONFIG_SCHED_CLASS_EXT depende de BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF
@@ -944,47 +989,56 @@ fi
 # compilación y añade símbolos de depuración extra al kernel resultante.
 SCHED_EXT_APPLIED="no"
 
-if whiptail --title "Instalador de Kernel csr79a" \
-    --yesno "¿Deseas activar soporte de sched_ext (CONFIG_SCHED_CLASS_EXT)?\n\nEsto permite cargar schedulers BPF de sched-ext (scx_lavd, scx_bpfland, etc.) sin tener que recompilar el kernel más adelante solo por esto.\n\nCOSTE: requiere activar CONFIG_DEBUG_INFO_BTF, que necesita 'pahole' para generar información BTF desde DWARF durante la compilación. Esto alarga el tiempo de build y añade símbolos de depuración extra al kernel resultante.\n\nSi no piensas usar sched-ext (scx_loader/scxctl o similar), puedes decir que no sin perder nada." \
-    18 76; then
-    log "Activando soporte de sched_ext (CONFIG_SCHED_CLASS_EXT y dependencias)..."
-    scripts/config --enable CONFIG_BPF
-    scripts/config --enable CONFIG_BPF_SYSCALL
-    scripts/config --enable CONFIG_BPF_JIT
-    scripts/config --enable CONFIG_BPF_JIT_ALWAYS_ON
-    scripts/config --enable CONFIG_BPF_JIT_DEFAULT_ON
-    # CONFIG_DEBUG_INFO_BTF depende de "!DEBUG_INFO_NONE" (choice en
-    # lib/Kconfig.debug). Un kernel de Debian normal trae
-    # CONFIG_DEBUG_INFO_NONE=y heredado en la config base; si no se
-    # desactiva aquí y se selecciona explícitamente una variante DWARF,
-    # 'olddefconfig' descarta CONFIG_DEBUG_INFO_BTF pese al --enable de
-    # abajo, sin que falte 'pahole' para nada.
-    scripts/config --disable CONFIG_DEBUG_INFO_NONE
-    scripts/config --enable CONFIG_DEBUG_INFO
-    scripts/config --enable CONFIG_DEBUG_INFO_DWARF5
-    scripts/config --enable CONFIG_DEBUG_INFO_BTF
-    scripts/config --enable CONFIG_SCHED_CLASS_EXT
-    SCHED_EXT_APPLIED="yes"
+if base_has CONFIG_SCHED_CLASS_EXT; then
+    ok "El soporte de sched_ext (CONFIG_SCHED_CLASS_EXT) ya viene resuelto en tu kernel base. No hace falta preguntar ni pagar el coste de build de DEBUG_INFO_BTF."
 else
-    log "Se omite el soporte de sched_ext por elección del usuario."
+    if whiptail --title "Instalador de Kernel csr79a" \
+        --yesno "¿Deseas activar soporte de sched_ext (CONFIG_SCHED_CLASS_EXT)?\n\nEsto permite cargar schedulers BPF de sched-ext (scx_lavd, scx_bpfland, etc.) sin tener que recompilar el kernel más adelante solo por esto.\n\nCOSTE: requiere activar CONFIG_DEBUG_INFO_BTF, que necesita 'pahole' para generar información BTF desde DWARF durante la compilación. Esto alarga el tiempo de build y añade símbolos de depuración extra al kernel resultante.\n\nSi no piensas usar sched-ext (scx_loader/scxctl o similar), puedes decir que no sin perder nada." \
+        18 76; then
+        log "Activando soporte de sched_ext (CONFIG_SCHED_CLASS_EXT y dependencias)..."
+        scripts/config --enable CONFIG_BPF
+        scripts/config --enable CONFIG_BPF_SYSCALL
+        scripts/config --enable CONFIG_BPF_JIT
+        scripts/config --enable CONFIG_BPF_JIT_ALWAYS_ON
+        scripts/config --enable CONFIG_BPF_JIT_DEFAULT_ON
+        # CONFIG_DEBUG_INFO_BTF depende de "!DEBUG_INFO_NONE" (choice en
+        # lib/Kconfig.debug). Un kernel de Debian normal trae
+        # CONFIG_DEBUG_INFO_NONE=y heredado en la config base; si no se
+        # desactiva aquí y se selecciona explícitamente una variante DWARF,
+        # 'olddefconfig' descarta CONFIG_DEBUG_INFO_BTF pese al --enable de
+        # abajo, sin que falte 'pahole' para nada.
+        scripts/config --disable CONFIG_DEBUG_INFO_NONE
+        scripts/config --enable CONFIG_DEBUG_INFO
+        scripts/config --enable CONFIG_DEBUG_INFO_DWARF5
+        scripts/config --enable CONFIG_DEBUG_INFO_BTF
+        scripts/config --enable CONFIG_SCHED_CLASS_EXT
+        SCHED_EXT_APPLIED="yes"
+    else
+        log "Se omite el soporte de sched_ext por elección del usuario."
+    fi
 fi
 
 # ---------------------------------------------------------------------------
 # 7.3 CONFIG_NTSYNC (primitivas de sincronización NT para Wine/Proton):
-#     opcional, se pregunta. Driver independiente, sin dependencias
-#     complejas (a diferencia de sched_ext), pero solo aporta algo si
-#     usas Wine/Proton.
+#     check-first. Si ya viene resuelto (=y o =m) en la config base, no
+#     se pregunta. Ya es el caso en kernels recientes (llegó a mainline
+#     en 6.14); Debian 13/trixie con 6.12 sigue siendo el caso donde de
+#     verdad falta y la pregunta tiene sentido.
 # ---------------------------------------------------------------------------
 NTSYNC_APPLIED="no"
 
-if whiptail --title "Instalador de Kernel csr79a" \
-    --yesno "¿Deseas activar CONFIG_NTSYNC (primitivas de sincronización NT)?\n\nEste driver solo aporta algo si usas Wine o Proton (juegos/aplicaciones Windows): mejora el rendimiento de la sincronización de hilos frente a la emulación en espacio de usuario.\n\nSi no usas Wine ni Proton, esta opción no tendrá ningún efecto en tu sistema. Debian no lo trae activado por defecto." \
-    14 76; then
-    log "Activando CONFIG_NTSYNC (sincronización NT para Wine/Proton)..."
-    scripts/config --enable CONFIG_NTSYNC
-    NTSYNC_APPLIED="yes"
+if base_has CONFIG_NTSYNC; then
+    ok "CONFIG_NTSYNC ya viene resuelto en tu kernel base. No hace falta preguntar ni forzar nada."
 else
-    log "Se omite CONFIG_NTSYNC por elección del usuario."
+    if whiptail --title "Instalador de Kernel csr79a" \
+        --yesno "¿Deseas activar CONFIG_NTSYNC (primitivas de sincronización NT)?\n\nEste driver solo aporta algo si usas Wine o Proton (juegos/aplicaciones Windows): mejora el rendimiento de la sincronización de hilos frente a la emulación en espacio de usuario.\n\nSi no usas Wine ni Proton, esta opción no tendrá ningún efecto en tu sistema. Debian no lo trae activado por defecto." \
+        14 76; then
+        log "Activando CONFIG_NTSYNC (sincronización NT para Wine/Proton)..."
+        scripts/config --enable CONFIG_NTSYNC
+        NTSYNC_APPLIED="yes"
+    else
+        log "Se omite CONFIG_NTSYNC por elección del usuario."
+    fi
 fi
 
 # ---------------------------------------------------------------------------
